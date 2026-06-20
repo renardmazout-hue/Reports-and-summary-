@@ -1,13 +1,17 @@
-// v2
 // ══════════════════════════════════════════════
 //  Reports & Summary — Backend Railway
-//  Routes : POST /api/login  |  POST /api/analyze
+//  Routes : POST /api/login  |  POST /api/analyze  |  GET /api/usage
+//  Rate limiting : SQLite (par IP + par UID, reset quotidien)
 // ══════════════════════════════════════════════
 require("dotenv").config();
-const express    = require("express");
-const cors       = require("cors");
-const jwt        = require("jsonwebtoken");
-const fetch      = require("node-fetch");
+const express     = require("express");
+const cors        = require("cors");
+const jwt         = require("jsonwebtoken");
+const fetch       = require("node-fetch");
+const Database    = require("better-sqlite3");
+const path        = require("path");
+const bcrypt      = require("bcryptjs");
+const crypto      = require("crypto");
 
 const app  = express();
 app.use(cors());
@@ -18,11 +22,114 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
 const JWT_SECRET        = process.env.JWT_SECRET        || "changez-ce-secret";
 const ADMIN_EMAIL       = process.env.ADMIN_EMAIL       || "admin@texturno.com";
 const ADMIN_PASSWORD    = process.env.ADMIN_PASSWORD    || "";
-const PORT              = process.env.PORT              || 3000;
+const PORT               = process.env.PORT              || 3000;
+
+// Limite IP — filet anti-abus générique (pas lié au plan)
+const RATE_LIMIT_PER_IP = parseInt(process.env.RATE_LIMIT_PER_IP || "300", 10);
+
+// Limites par plan — DOIT rester synchronisé avec l'objet PLANS du frontend
+// (reqPerDay). C'est la seule source de vérité côté serveur.
+const PLAN_LIMITS = {
+  starter: 20,
+  basic:   40,
+  pro:     100,
+  premium: 250,
+};
+function limitForPlan(plan) {
+  return PLAN_LIMITS[plan] || PLAN_LIMITS.starter;
+}
+
+// Chemin DB — IMPORTANT : doit pointer vers un volume persistant Railway
+// (Railway → Settings → Volumes → mount path ex: /data)
+const DB_PATH = process.env.SQLITE_PATH || path.join(__dirname, "rate-limits.db");
 
 // ── Vérification au démarrage
 if (!ANTHROPIC_API_KEY) console.warn("⚠️  ANTHROPIC_API_KEY manquante !");
 if (!ADMIN_PASSWORD)    console.warn("⚠️  ADMIN_PASSWORD manquante !");
+
+// ══════════════════════════════════════════════
+//  SQLite — init
+// ══════════════════════════════════════════════
+const db = new Database(DB_PATH);
+db.pragma("journal_mode = WAL");
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS rate_limits (
+    identifier TEXT NOT NULL,
+    type       TEXT NOT NULL CHECK(type IN ('ip','uid')),
+    date       TEXT NOT NULL,
+    count      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (identifier, type, date)
+  );
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    uid           TEXT PRIMARY KEY,
+    email         TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    name          TEXT,
+    plan          TEXT NOT NULL DEFAULT 'starter',
+    created_at    TEXT NOT NULL
+  );
+`);
+
+const findUserByEmailStmt = db.prepare(`SELECT * FROM users WHERE email = ?`);
+const findUserByUidStmt   = db.prepare(`SELECT * FROM users WHERE uid = ?`);
+const insertUserStmt      = db.prepare(
+  `INSERT INTO users (uid, email, password_hash, name, plan, created_at) VALUES (?, ?, ?, ?, 'starter', ?)`
+);
+const updateUserPlanStmt  = db.prepare(`UPDATE users SET plan = ? WHERE uid = ?`);
+
+function generateUid() {
+  return "U-" + crypto.randomBytes(5).toString("hex").toUpperCase().slice(0, 8);
+}
+
+// Nettoyage léger : on ne garde que les 7 derniers jours de compteurs
+db.prepare(`DELETE FROM rate_limits WHERE date < date('now', '-7 days')`).run();
+
+const selectStmt = db.prepare(
+  `SELECT count FROM rate_limits WHERE identifier = ? AND type = ? AND date = ?`
+);
+const insertStmt = db.prepare(
+  `INSERT INTO rate_limits (identifier, type, date, count) VALUES (?, ?, ?, 1)`
+);
+const incrementStmt = db.prepare(
+  `UPDATE rate_limits SET count = count + 1 WHERE identifier = ? AND type = ? AND date = ?`
+);
+
+function todayUTC() {
+  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+// Vérifie + incrémente atomiquement le compteur. Retourne { allowed, count, limit }
+function checkAndIncrement(identifier, type, limit) {
+  const date = todayUTC();
+  const run = db.transaction(() => {
+    const row = selectStmt.get(identifier, type, date);
+    if (!row) {
+      insertStmt.run(identifier, type, date);
+      return { allowed: true, count: 1, limit };
+    }
+    if (row.count >= limit) {
+      return { allowed: false, count: row.count, limit };
+    }
+    incrementStmt.run(identifier, type, date);
+    return { allowed: true, count: row.count + 1, limit };
+  });
+  return run();
+}
+
+function getCurrentCount(identifier, type) {
+  const row = selectStmt.get(identifier, type, todayUTC());
+  return row ? row.count : 0;
+}
+
+function getClientIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (forwarded) return forwarded.split(",")[0].trim();
+  return req.socket.remoteAddress;
+}
 
 // ── Middleware JWT
 function requireAuth(req, res, next) {
@@ -37,18 +144,58 @@ function requireAuth(req, res, next) {
   }
 }
 
+// ── Middleware rate limit (IP puis UID selon le plan réel, reset quotidien)
+function rateLimitMiddleware(req, res, next) {
+  const ip = getClientIp(req);
+
+  const ipResult = checkAndIncrement(ip, "ip", RATE_LIMIT_PER_IP);
+  if (!ipResult.allowed) {
+    return res.status(429).json({
+      error: "Limite quotidienne par IP atteinte.",
+      type: "ip",
+      identifier: ip,
+      count: ipResult.count,
+      limit: ipResult.limit,
+    });
+  }
+
+  // L'admin n'est pas soumis au quota par plan
+  if (req.user?.role === "admin") return next();
+
+  const uid = req.user?.uid;
+  if (!uid) return res.status(401).json({ error: "Compte invalide." });
+
+  const userRow = findUserByUidStmt.get(uid);
+  const plan = userRow?.plan || "starter";
+  const limit = limitForPlan(plan);
+
+  const uidResult = checkAndIncrement(uid, "uid", limit);
+  if (!uidResult.allowed) {
+    return res.status(429).json({
+      error: `Limite quotidienne atteinte pour le plan ${plan} (${limit} requêtes/jour).`,
+      type: "uid",
+      identifier: uid,
+      plan,
+      count: uidResult.count,
+      limit: uidResult.limit,
+    });
+  }
+
+  next();
+}
+
 // ══════════════════════════════════════════════
 //  POST /api/login
 // ══════════════════════════════════════════════
-app.post("/api/login", (req, res) => {
+app.post("/api/login", async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password)
     return res.status(400).json({ error: "Email et mot de passe requis." });
 
-  if (
-    email.trim().toLowerCase() === ADMIN_EMAIL.toLowerCase() &&
-    password === ADMIN_PASSWORD
-  ) {
+  const normEmail = email.trim().toLowerCase();
+
+  // 1. Compte admin (identifiants fixes en variables d'env)
+  if (normEmail === ADMIN_EMAIL.toLowerCase() && password === ADMIN_PASSWORD) {
     const token = jwt.sign(
       { email: ADMIN_EMAIL, role: "admin" },
       JWT_SECRET,
@@ -57,13 +204,106 @@ app.post("/api/login", (req, res) => {
     return res.json({ token, user: { email: ADMIN_EMAIL, role: "admin", name: "Administratrice" } });
   }
 
+  // 2. Compte client (table users)
+  const userRow = findUserByEmailStmt.get(normEmail);
+  if (userRow && (await bcrypt.compare(password, userRow.password_hash))) {
+    const token = jwt.sign(
+      { uid: userRow.uid, email: userRow.email, role: "user" },
+      JWT_SECRET,
+      { expiresIn: "30d" }
+    );
+    return res.json({
+      token,
+      user: { uid: userRow.uid, email: userRow.email, name: userRow.name, role: "user", plan: userRow.plan },
+    });
+  }
+
   return res.status(401).json({ error: "Email ou mot de passe incorrect." });
 });
 
 // ══════════════════════════════════════════════
-//  POST /api/analyze  (protégé JWT)
+//  POST /api/register  — création de compte client
 // ══════════════════════════════════════════════
-app.post("/api/analyze", requireAuth, async (req, res) => {
+app.post("/api/register", async (req, res) => {
+  const { name, email, password } = req.body || {};
+  if (!name || !email || !password)
+    return res.status(400).json({ error: "Nom, email et mot de passe requis." });
+  if (password.length < 6)
+    return res.status(400).json({ error: "Le mot de passe doit comporter au moins 6 caractères." });
+
+  const normEmail = email.trim().toLowerCase();
+  if (normEmail === ADMIN_EMAIL.toLowerCase())
+    return res.status(400).json({ error: "Cet email est réservé." });
+  if (findUserByEmailStmt.get(normEmail))
+    return res.status(409).json({ error: "Un compte existe déjà avec cet email." });
+
+  const uid = generateUid();
+  const passwordHash = await bcrypt.hash(password, 10);
+  insertUserStmt.run(uid, normEmail, passwordHash, name.trim(), new Date().toISOString());
+
+  const token = jwt.sign({ uid, email: normEmail, role: "user" }, JWT_SECRET, { expiresIn: "30d" });
+  return res.json({
+    token,
+    user: { uid, email: normEmail, name: name.trim(), role: "user", plan: "starter" },
+  });
+});
+
+// ══════════════════════════════════════════════
+//  GET /api/me — relit le plan à jour depuis la DB
+// ══════════════════════════════════════════════
+app.get("/api/me", requireAuth, (req, res) => {
+  if (req.user.role === "admin")
+    return res.json({ email: ADMIN_EMAIL, role: "admin", name: "Administratrice" });
+
+  const userRow = findUserByUidStmt.get(req.user.uid);
+  if (!userRow) return res.status(404).json({ error: "Compte introuvable." });
+  return res.json({ uid: userRow.uid, email: userRow.email, name: userRow.name, role: "user", plan: userRow.plan });
+});
+
+// ══════════════════════════════════════════════
+//  POST /api/admin/set-plan — admin uniquement
+//  Appelé quand l'admin valide un paiement et change le plan d'un client
+// ══════════════════════════════════════════════
+app.post("/api/admin/set-plan", requireAuth, (req, res) => {
+  if (req.user.role !== "admin")
+    return res.status(403).json({ error: "Accès réservé à l'administrateur." });
+
+  const { uid, plan } = req.body || {};
+  if (!uid || !PLAN_LIMITS[plan])
+    return res.status(400).json({ error: "uid et plan (starter|basic|pro|premium) requis." });
+
+  const userRow = findUserByUidStmt.get(uid);
+  if (!userRow) return res.status(404).json({ error: "Utilisateur introuvable." });
+
+  updateUserPlanStmt.run(plan, uid);
+  return res.json({ ok: true, uid, plan });
+});
+
+// ══════════════════════════════════════════════
+//  GET /api/usage  (protégé JWT) — quota restant du jour
+// ══════════════════════════════════════════════
+app.get("/api/usage", requireAuth, (req, res) => {
+  const ip = getClientIp(req);
+  const ipUsage = { count: getCurrentCount(ip, "ip"), limit: RATE_LIMIT_PER_IP };
+
+  if (req.user.role === "admin") {
+    return res.json({ ip: ipUsage, uid: { count: 0, limit: null, plan: null, unlimited: true } });
+  }
+
+  const userRow = findUserByUidStmt.get(req.user.uid);
+  const plan = userRow?.plan || "starter";
+  const limit = limitForPlan(plan);
+
+  res.json({
+    ip: ipUsage,
+    uid: { count: getCurrentCount(req.user.uid, "uid"), limit, plan },
+  });
+});
+
+// ══════════════════════════════════════════════
+//  POST /api/analyze  (protégé JWT + rate limit)
+// ══════════════════════════════════════════════
+app.post("/api/analyze", requireAuth, rateLimitMiddleware, async (req, res) => {
   const body = req.body || {};
 
   if (!ANTHROPIC_API_KEY)
@@ -102,4 +342,4 @@ app.post("/api/analyze", requireAuth, async (req, res) => {
 // ── Health check
 app.get("/", (req, res) => res.json({ status: "ok", app: "TEXTURNO Backend" }));
 
-app.listen(PORT, () => console.log(`✅ Serveur démarré sur le port ${PORT}`)
+app.listen(PORT, () => console.log(`✅ Serveur démarré sur le port ${PORT}`));
