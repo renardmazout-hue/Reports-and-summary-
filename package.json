@@ -1,0 +1,15 @@
+{                                    ← ouverture
+  "name": "reports-summary-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {                       ← ouverture scripts
+    "start": "node server.js"
+  },                                 ← fermeture scripts
+  "dependencies": {                  ← ouverture dependencies
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "jsonwebtoken": "^9.0.2",
+    "dotenv": "^16.3.1",
+    "node-fetch": "^2.7.0"
+  }                                  ← fermeture dependencies
+}                                    ← fermeture finale
