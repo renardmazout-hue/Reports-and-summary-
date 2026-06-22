@@ -440,6 +440,9 @@ app.get("/api/admin/users", requireAuth, (req, res) => {
   return res.json({ users });
 });
 
+// ── Ping (utilisé par le frontend pour vérifier que le backend est joignable)
+app.get("/api/ping", (req, res) => res.json({ ok: true }));
+
 // ── Health check
 app.get("/", (req, res) => res.json({ status: "ok", app: "TEXTURNO Backend" }));
 
