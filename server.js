@@ -339,6 +339,107 @@ app.post("/api/analyze", requireAuth, rateLimitMiddleware, async (req, res) => {
   }
 });
 
+
+// ══════════════════════════════════════════════
+//  TABLE payments — init
+// ══════════════════════════════════════════════
+db.exec(`
+  CREATE TABLE IF NOT EXISTS payments (
+    id          TEXT PRIMARY KEY,
+    uid         TEXT NOT NULL,
+    email       TEXT NOT NULL,
+    name        TEXT,
+    plan        TEXT NOT NULL,
+    amount      INTEGER NOT NULL,
+    method      TEXT NOT NULL,
+    phone       TEXT,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+  );
+`);
+
+const insertPaymentStmt = db.prepare(
+  `INSERT INTO payments (id, uid, email, name, plan, amount, method, phone, status, created_at, updated_at)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
+);
+const getPaymentsStmt      = db.prepare(`SELECT * FROM payments ORDER BY created_at DESC`);
+const getPaymentByIdStmt   = db.prepare(`SELECT * FROM payments WHERE id = ?`);
+const updatePaymentStmt    = db.prepare(
+  `UPDATE payments SET status = ?, updated_at = ? WHERE id = ?`
+);
+
+// ══════════════════════════════════════════════
+//  POST /api/payment — client soumet un paiement
+// ══════════════════════════════════════════════
+app.post("/api/payment", requireAuth, (req, res) => {
+  if (req.user.role === "admin")
+    return res.status(400).json({ error: "L'admin ne peut pas soumettre un paiement." });
+
+  const { plan, amount, method, phone } = req.body || {};
+  if (!plan || !amount || !method)
+    return res.status(400).json({ error: "plan, amount et method requis." });
+  if (!PLAN_LIMITS[plan])
+    return res.status(400).json({ error: "Plan invalide." });
+
+  const userRow = findUserByUidStmt.get(req.user.uid);
+  if (!userRow) return res.status(404).json({ error: "Compte introuvable." });
+
+  const id  = "PAY-" + crypto.randomBytes(4).toString("hex").toUpperCase();
+  const now = new Date().toISOString();
+  insertPaymentStmt.run(id, userRow.uid, userRow.email, userRow.name, plan, amount, method, phone || null, now, now);
+
+  return res.json({ ok: true, id, status: "pending" });
+});
+
+// ══════════════════════════════════════════════
+//  GET /api/admin/payments — admin uniquement
+// ══════════════════════════════════════════════
+app.get("/api/admin/payments", requireAuth, (req, res) => {
+  if (req.user.role !== "admin")
+    return res.status(403).json({ error: "Accès réservé à l'administrateur." });
+
+  const payments = getPaymentsStmt.all();
+  return res.json({ payments });
+});
+
+// ══════════════════════════════════════════════
+//  PATCH /api/admin/payment/:id — valider ou rejeter
+// ══════════════════════════════════════════════
+app.patch("/api/admin/payment/:id", requireAuth, (req, res) => {
+  if (req.user.role !== "admin")
+    return res.status(403).json({ error: "Accès réservé à l'administrateur." });
+
+  const { id } = req.params;
+  const { status } = req.body || {};
+  if (!["approved", "rejected"].includes(status))
+    return res.status(400).json({ error: "status doit être 'approved' ou 'rejected'." });
+
+  const payment = getPaymentByIdStmt.get(id);
+  if (!payment) return res.status(404).json({ error: "Paiement introuvable." });
+
+  const now = new Date().toISOString();
+  updatePaymentStmt.run(status, now, id);
+
+  // Si approuvé → upgrade le plan du client automatiquement
+  if (status === "approved") {
+    updateUserPlanStmt.run(payment.plan, payment.uid);
+  }
+
+  return res.json({ ok: true, id, status });
+});
+
+// ══════════════════════════════════════════════
+//  GET /api/admin/users — liste tous les clients
+// ══════════════════════════════════════════════
+app.get("/api/admin/users", requireAuth, (req, res) => {
+  if (req.user.role !== "admin")
+    return res.status(403).json({ error: "Accès réservé à l'administrateur." });
+
+  const users = db.prepare(`SELECT uid, email, name, plan, created_at FROM users ORDER BY created_at DESC`).all();
+  return res.json({ users });
+});
+
 // ── Health check
 app.get("/", (req, res) => res.json({ status: "ok", app: "TEXTURNO Backend" }));
 
