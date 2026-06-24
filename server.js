@@ -353,15 +353,19 @@ db.exec(`
     amount      INTEGER NOT NULL,
     method      TEXT NOT NULL,
     phone       TEXT,
+    tx_ref      TEXT,
     status      TEXT NOT NULL DEFAULT 'pending',
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
   );
 `);
 
+// Migration silencieuse : ajoute tx_ref si table existait déjà sans cette colonne
+try { db.exec(`ALTER TABLE payments ADD COLUMN tx_ref TEXT`); } catch(e) { /* déjà présente */ }
+
 const insertPaymentStmt = db.prepare(
-  `INSERT INTO payments (id, uid, email, name, plan, amount, method, phone, status, created_at, updated_at)
-   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
+  `INSERT INTO payments (id, uid, email, name, plan, amount, method, phone, tx_ref, status, created_at, updated_at)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
 );
 const getPaymentsStmt      = db.prepare(`SELECT * FROM payments ORDER BY created_at DESC`);
 const getPaymentByIdStmt   = db.prepare(`SELECT * FROM payments WHERE id = ?`);
@@ -376,7 +380,7 @@ app.post("/api/payment", requireAuth, (req, res) => {
   if (req.user.role === "admin")
     return res.status(400).json({ error: "L'admin ne peut pas soumettre un paiement." });
 
-  const { plan, amount, method, phone } = req.body || {};
+  const { plan, amount, method, phone, txRef } = req.body || {};
   if (!plan || !amount || !method)
     return res.status(400).json({ error: "plan, amount et method requis." });
   if (!PLAN_LIMITS[plan])
@@ -385,9 +389,15 @@ app.post("/api/payment", requireAuth, (req, res) => {
   const userRow = findUserByUidStmt.get(req.user.uid);
   if (!userRow) return res.status(404).json({ error: "Compte introuvable." });
 
+  // Vérification doublon référence TX
+  if (txRef) {
+    const dup = db.prepare(`SELECT id FROM payments WHERE tx_ref = ?`).get(txRef.trim());
+    if (dup) return res.status(409).json({ error: "Cette référence de transaction existe déjà." });
+  }
+
   const id  = "PAY-" + crypto.randomBytes(4).toString("hex").toUpperCase();
   const now = new Date().toISOString();
-  insertPaymentStmt.run(id, userRow.uid, userRow.email, userRow.name, plan, amount, method, phone || null, now, now);
+  insertPaymentStmt.run(id, userRow.uid, userRow.email, userRow.name, plan, amount, method, phone || null, txRef || null, now, now);
 
   return res.json({ ok: true, id, status: "pending" });
 });
@@ -399,7 +409,19 @@ app.get("/api/admin/payments", requireAuth, (req, res) => {
   if (req.user.role !== "admin")
     return res.status(403).json({ error: "Accès réservé à l'administrateur." });
 
-  const payments = getPaymentsStmt.all();
+  const raw = getPaymentsStmt.all();
+  // Normalisation : adapte les noms de colonnes SQLite au format attendu par le frontend
+  const payments = raw.map(p => ({
+    ...p,
+    txRef:    p.tx_ref    || "",
+    date:     p.created_at,
+    credits:  (PLAN_LIMITS[p.plan] != null) ? ({ starter:20, basic:200, pro:1000, premium:3000 }[p.plan] || 0) : 0,
+    uid:      p.uid,
+    credited: p.status === "approved",
+    aiAnalysis: null,
+    adminNote:  "",
+    history: [{ action: "submitted", date: p.created_at, by: "user" }],
+  }));
   return res.json({ payments });
 });
 
