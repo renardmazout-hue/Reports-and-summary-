@@ -463,6 +463,29 @@ app.get("/api/admin/users", requireAuth, (req, res) => {
 });
 
 // ── Ping (utilisé par le frontend pour vérifier que le backend est joignable)
+// ══════════════════════════════════════════════
+//  GET /api/my-payments — paiements de l'utilisateur connecté
+// ══════════════════════════════════════════════
+app.get("/api/my-payments", requireAuth, (req, res) => {
+  if (req.user.role === "admin") return res.json({ payments: [] });
+
+  const PLAN_CREDITS = { starter: 20, basic: 200, pro: 1000, premium: 3000 };
+  const rows = db.prepare(`SELECT * FROM payments WHERE uid = ? ORDER BY created_at DESC`).all(req.user.uid);
+  const payments = rows.map(p => ({
+    id:      p.id,
+    uid:     p.uid,
+    plan:    p.plan,
+    amount:  p.amount,
+    method:  p.method,
+    phone:   p.phone,
+    txRef:   p.tx_ref || "",
+    status:  p.status,
+    credits: PLAN_CREDITS[p.plan] || 0,
+    date:    p.created_at,
+  }));
+  return res.json({ payments });
+});
+
 app.get("/api/ping", (req, res) => res.json({ ok: true }));
 
 // ── Health check
